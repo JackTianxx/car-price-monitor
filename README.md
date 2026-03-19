@@ -57,7 +57,7 @@
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/JackMidn/car-price-monitor.git
+git clone https://github.com/JackTianxx/car-price-monitor.git
 cd car-price-monitor
 
 # 2. 配置数据库连接（也可直接用环境变量）
@@ -142,7 +142,7 @@ car-price-monitor/
 如有问题、建议或合作意向，欢迎通过以下方式联系：
 
 - **Email**：pe_tianjunjie@126.com
-- **GitHub Issues**：[提交 Issue](https://github.com/JackMidn/car-price-monitor/issues)
+- **GitHub Issues**：[提交 Issue](https://github.com/JackTianxx/car-price-monitor/issues)
 
 ## License
 
