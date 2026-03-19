@@ -1,3 +1,14 @@
+"""
+汽车报价采集核心模块
+
+支持三个平台：
+- 汽车之家 (autohome)：通过官方 API 获取经销商报价，分省份/车型两个粒度
+- 懂车帝 (dongchedi)：通过开放 API 获取各城市车系和车型报价
+- 易车网 (yiche)：解析 HTML 页面获取全国参考价（页面 SPA 化后可能失效）
+
+采集流程：
+  run_crawl(task_id) → crawl_autohome / crawl_dongchedi / crawl_yiche → _upsert_prices(db)
+"""
 import httpx
 import json
 import asyncio
@@ -10,6 +21,7 @@ from app.models import CarPrice, CrawlTask, CarSeries
 
 # ========== 汽车之家 ==========
 
+# 汽车之家请求头，模拟 PC 浏览器访问，Authorization 为接口签名
 AUTOHOME_HEADERS = {
     "Accept": "application/json",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -19,6 +31,7 @@ AUTOHOME_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
 }
 
+# 全国省份列表（省级行政区编码），用于汽车之家按省遍历经销商
 PROVINCES = [
     (110000, "北京"), (120000, "天津"), (130000, "河北"), (140000, "山西"),
     (150000, "内蒙古"), (210000, "辽宁"), (220000, "吉林"), (230000, "黑龙江"),
@@ -30,7 +43,8 @@ PROVINCES = [
     (650000, "新疆"),
 ]
 
-# 汽车之家城市ID列表 (用于参考项目的 AjaxDealerGetSeriesMinpriceWithSpecs 接口)
+# 主要城市 ID 列表（汽车之家城市编码），用于车型级别报价查询
+# 覆盖全国 36 个核心城市，兼顾数据量与采集效率
 AUTOHOME_CITY_IDS = [
     (110100, "北京"), (120100, "天津"), (310100, "上海"), (500100, "重庆"),
     (440100, "广州"), (440300, "深圳"), (510100, "成都"), (330100, "杭州"),
@@ -95,10 +109,11 @@ async def autohome_fetch_province(
                 "raw_data": json.dumps(d, ensure_ascii=False)[:2000],
             })
 
+        # 判断是否还有下一页
         if page >= result.get("pagecount", 1):
             break
         page += 1
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.5)  # 礼貌性延迟，避免请求过于频繁
 
     return results
 
@@ -108,7 +123,7 @@ async def autohome_fetch_spec_names(
 ) -> dict[int, str]:
     """汽车之家: 通过经销商spec接口获取 specId->specName 映射表"""
     spec_map = {}
-    # 先从 AjaxDealerGetSeriesMinpriceWithSpecs 拿一个 dealerId
+    # 第一步：调用城市报价接口拿到一个有效的 dealerId，作为后续查询的入参
     url = (
         f"https://www.autohome.com.cn/ashx/dealer/"
         f"AjaxDealerGetSeriesMinpriceWithSpecs.ashx"
@@ -132,7 +147,7 @@ async def autohome_fetch_spec_names(
     except Exception:
         return spec_map
 
-    # 用 dealerId 调 getdealerspeclist 获取完整 specName
+    # 第二步：用经销商 ID 查询该经销商在售的所有车型列表，提取 specId->specName 映射
     url2 = (
         f"https://dealer.autohome.com.cn/api/dealerlq/car/dealercars/getdealerspeclist"
         f"?_appid=dealer&dealerId={dealer_id}&seriesId={series_id}"
@@ -179,7 +194,7 @@ async def autohome_fetch_spec_prices(
     if data.get("returncode") != 0 or not data.get("result"):
         return results
 
-    # 从城市名推断省份
+    # 通过城市->省份映射表推断省份（API 不直接返回省份信息）
     province = CITY_PROVINCE_MAP.get(city_name, "")
 
     for series_item in data["result"]:
@@ -281,7 +296,7 @@ async def crawl_autohome(series: CarSeries, task: CrawlTask, db: Session):
 
     total = 0
     async with httpx.AsyncClient() as client:
-        # 第1步: 车系级别 - 遍历省份获取经销商报价
+        # 第1步：车系级别 - 遍历全国省份，获取各省经销商报价列表
         for i, (prov_id, prov_name) in enumerate(PROVINCES):
             task.message = f"[汽车之家] 车系报价: {prov_name} ({i+1}/{len(PROVINCES)})"
             db.commit()
@@ -295,12 +310,12 @@ async def crawl_autohome(series: CarSeries, task: CrawlTask, db: Session):
 
             await asyncio.sleep(0.3)
 
-        # 第2步: 获取 specId -> specName 映射
+        # 第2步：获取车型名称映射表（specId -> 车型名称），避免返回结果只有 ID
         task.message = f"[汽车之家] 获取车型名称映射..."
         db.commit()
         spec_name_map = await autohome_fetch_spec_names(client, series.autohome_id)
 
-        # 第3步: 车型级别 - 按主要城市获取spec报价
+        # 第3步：车型级别 - 遍历主要城市，获取各车型具体报价（精度更高）
         task.message = f"[汽车之家] 采集车型级别报价..."
         db.commit()
         for i, (city_id, city_name) in enumerate(AUTOHOME_CITY_IDS):
@@ -318,11 +333,13 @@ async def crawl_autohome(series: CarSeries, task: CrawlTask, db: Session):
 
 # ========== 懂车帝 ==========
 
+# 懂车帝请求头，模拟 PC 端浏览器
 DONGCHEDI_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
     "Referer": "https://www.dongchedi.com/",
 }
 
+# 懂车帝采集城市列表（50个主要城市），按城市名直接查询，无需编码
 DONGCHEDI_CITIES = [
     "北京", "上海", "广州", "深圳", "成都", "杭州", "武汉", "南京",
     "重庆", "天津", "苏州", "西安", "长沙", "沈阳", "青岛", "郑州",
@@ -333,6 +350,7 @@ DONGCHEDI_CITIES = [
     "兰州", "银川",
 ]
 
+# 城市->省份映射表，用于在 API 不返回省份时补全省份字段
 CITY_PROVINCE_MAP = {
     "北京": "北京", "上海": "上海", "天津": "天津", "重庆": "重庆",
     "广州": "广东", "深圳": "广东", "东莞": "广东", "佛山": "广东",
@@ -383,7 +401,7 @@ async def dongchedi_get_car_ids(client: httpx.AsyncClient, series_id: int, city_
     try:
         resp = await client.get(url, headers=DONGCHEDI_HEADERS, timeout=10)
         data = resp.json()
-        # car_id_list 在 concern_obj 根字段
+        # car_id_list 存储在 concern_obj 下，值为逗号分隔的字符串，如 "12345,67890"
         concern = data.get("concern_obj", {})
         car_id_str = concern.get("car_id_list", "")
         if car_id_str:
@@ -505,7 +523,7 @@ async def crawl_dongchedi(series: CarSeries, task: CrawlTask, db: Session):
         if not dcd_id:
             return 0
 
-        # 获取车款ID列表
+        # 先获取该车系下的所有车款 ID（每款车型对应一个 car_id）
         task.message = f"[懂车帝] 获取{series.name}车款列表..."
         db.commit()
         car_ids = await dongchedi_get_car_ids(client, dcd_id)
@@ -514,13 +532,13 @@ async def crawl_dongchedi(series: CarSeries, task: CrawlTask, db: Session):
             task.message = f"[懂车帝] 采集: {city} ({i+1}/{len(DONGCHEDI_CITIES)})"
             db.commit()
 
-            # 车系级别报价
+            # 车系级别报价（价格区间，快速了解该城市大盘行情）
             refer = await dongchedi_fetch_refer_price(client, dcd_id, series.name, city, series.id)
             if refer:
                 _upsert_prices(db, [refer])
                 total += 1
 
-            # 车型级别报价
+            # 车型级别报价（精确到具体款型，最多取前10款避免请求过多）
             if car_ids:
                 specs = await dongchedi_fetch_car_prices(client, car_ids[:10], series.name, city, series.id)
                 if specs:
@@ -534,6 +552,7 @@ async def crawl_dongchedi(series: CarSeries, task: CrawlTask, db: Session):
 
 # ========== 易车网 ==========
 
+# 易车网请求头，注意：易车网主要页面已 SPA 化，HTML 爬取可能无法获取动态渲染内容
 YICHE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -553,11 +572,11 @@ async def yiche_fetch_series(
             return results
         html = resp.text
 
-        # 提取车系级别降价信息
+        # 用正则从 HTML 中提取车系最高降价幅度
         discount_match = re.search(r'最高降\s*([\d.]+)\s*万', html)
 
-        # 提取车型列表: 车名、指导价、经销商报价
-        # 易车页面格式: <a class="car-item-jump">车名</a> ... <span class="fouth">指导价</span> <span class="five">报价</span>
+        # 提取车型列表：车名、指导价、经销商报价
+        # 易车页面结构：<a class="car-item-jump">车名</a> ... <span class="fouth">指导价</span> <span class="five">报价</span>
         car_names = re.findall(r'class="car-item-jump"[^>]*>([^<]+)', html)
         guide_prices = re.findall(r'class="fouth"[^>]*>\s*([\d.]+)', html)
         dealer_prices = re.findall(r'class="five"[^>]*>\s*([\d.]+)', html)
@@ -591,7 +610,7 @@ async def yiche_fetch_series(
                 "raw_data": None,
             })
 
-        # 如果没提取到车型数据，尝试提取车系级别
+        # 车型级别未提取到数据时，降级尝试提取车系级别的价格区间
         if not results:
             guide_match = re.search(r'指导价[：:]\s*([\d.]+)\s*[-~]\s*([\d.]+)\s*万', html)
             dealer_match = re.search(r'(?:经销商报价|本地报价)[：:]\s*([\d.]+)\s*[-~]\s*([\d.]+)\s*万', html)
@@ -647,7 +666,12 @@ async def crawl_yiche(series: CarSeries, task: CrawlTask, db: Session):
 # ========== 公共方法 ==========
 
 def _upsert_prices(db: Session, rows: list[dict]):
-    """批量upsert报价数据"""
+    """
+    批量写入报价数据（INSERT ... ON DUPLICATE KEY UPDATE）
+
+    利用 MySQL 的 upsert 语义：数据已存在则更新价格字段，不存在则插入新记录。
+    唯一键由 crawl_date + dealer_id + series_name + spec_name + source 组成。
+    """
     for row in rows:
         if row.get("spec_name") is None:
             row["spec_name"] = ""
@@ -668,7 +692,17 @@ def _upsert_prices(db: Session, rows: list[dict]):
 
 
 async def run_crawl(task_id: int, db_factory, sources: list[str] = None):
-    """执行采集任务(支持多平台)"""
+    """
+    采集任务主入口（异步执行，由 FastAPI 后台任务调用）
+
+    根据 task.scope 决定采集范围：
+    - single：仅采集指定车系
+    - brand：采集同品牌下所有激活的车系
+    - all：采集数据库中全部激活车系
+
+    sources 控制采集哪些平台，默认三个平台全采。
+    任务状态实时写回数据库，前端轮询 /api/crawl/status/{id} 查看进度。
+    """
     if sources is None:
         sources = ["autohome", "dongchedi", "yiche"]
 
