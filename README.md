@@ -137,6 +137,13 @@ car-price-monitor/
 
 **如您不同意上述条款，请勿使用本项目。**
 
+## 联系方式
+
+如有问题、建议或合作意向，欢迎通过以下方式联系：
+
+- **Email**：pe_tianjunjie@126.com
+- **GitHub Issues**：[提交 Issue](https://github.com/JackMidn/car-price-monitor/issues)
+
 ## License
 
 [MIT](LICENSE)
